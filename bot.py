@@ -1,0 +1,1124 @@
+import os
+import re
+import time
+import json
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+import uvicorn
+
+
+# ================================================================
+# VERA - magicpin Merchant AI Assistant
+# Local-first implementation
+# ================================================================
+
+app = FastAPI(
+    title="magicpin Merchant AI Assistant (Vera)",
+    description="Merchant AI Assistant for magicpin challenge",
+    version="1.0.0",
+)
+
+START_TIME = time.time()
+
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "local")
+LLM_MODEL = os.getenv("LLM_MODEL", "local-rule-based")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
+
+contexts_store: Dict[Tuple[str, str], Dict[str, Any]] = {}
+conversations_store: Dict[str, List[Dict[str, Any]]] = {}
+processed_triggers: Dict[str, float] = {}
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def load_seed_file(
+    filename: str,
+    scope: str,
+    collection_key: str,
+    id_field: str,
+) -> None:
+    path = BASE_DIR / "dataset" / filename
+
+    if not path.exists():
+        print(f"[seed] File not found: {path}")
+        return
+
+    with path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    records = data.get(collection_key, [])
+
+    loaded = 0
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+
+        context_id = record.get(id_field)
+
+        if not context_id:
+            continue
+
+        contexts_store[(scope, context_id)] = {
+            "version": 1,
+            "payload": record,
+            "delivered_at": now_iso(),
+        }
+
+        loaded += 1
+
+    print(f"[seed] Loaded {loaded} {scope} records from {filename}")
+
+
+
+
+# ================================================================
+# REQUEST MODELS
+# ================================================================
+
+class ContextBody(BaseModel):
+    scope: str = Field(...)
+    context_id: str = Field(...)
+    version: int = Field(...)
+    payload: Dict[str, Any] = Field(...)
+    delivered_at: Optional[str] = Field(None)
+
+
+class TickBody(BaseModel):
+    now: str = Field(...)
+    available_triggers: List[str] = Field(default_factory=list)
+
+
+class ReplyBody(BaseModel):
+    conversation_id: str = Field(...)
+    merchant_id: Optional[str] = Field(None)
+    customer_id: Optional[str] = Field(None)
+    from_role: str = Field(...)
+    message: str = Field(...)
+    received_at: Optional[str] = Field(None)
+    turn_number: int = Field(1)
+
+
+# ================================================================
+# GENERIC HELPERS
+# ================================================================
+
+load_seed_file(
+    filename="merchants_seed.json",
+    scope="merchant",
+    collection_key="merchants",
+    id_field="merchant_id",
+)
+
+load_seed_file(
+    filename="customers_seed.json",
+    scope="customer",
+    collection_key="customers",
+    id_field="customer_id",
+)
+
+load_seed_file(
+    filename="triggers_seed.json",
+    scope="trigger",
+    collection_key="triggers",
+    id_field="id",
+)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def clean_text(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def first_non_empty(*values: Any) -> str:
+    for value in values:
+        text = clean_text(value)
+        if text:
+            return text
+    return ""
+
+
+def safe_lower(value: Any) -> str:
+    return clean_text(value).lower()
+
+
+def get_nested(data: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    current: Any = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+        if current is None:
+            return default
+    return current
+
+
+# ================================================================
+# CONTEXT LOOKUPS
+# ================================================================
+
+def get_context(scope: str, context_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not context_id:
+        return None
+
+    stored = contexts_store.get((scope, context_id))
+    if not stored:
+        return None
+
+    return stored.get("payload")
+
+
+def get_merchant_context(merchant_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    return get_context("merchant", merchant_id)
+
+
+def get_customer_context(customer_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    return get_context("customer", customer_id)
+
+
+def get_category_context(category_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    return get_context("category", category_id)
+
+
+def get_trigger_context(trigger_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    return get_context("trigger", trigger_id)
+
+
+def build_context_bundle(
+    merchant_id: Optional[str] = None,
+    customer_id: Optional[str] = None,
+    trigger_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    merchant = get_merchant_context(merchant_id)
+    customer = get_customer_context(customer_id)
+    trigger = get_trigger_context(trigger_id)
+
+    category = None
+    if merchant:
+        category_slug = first_non_empty(
+            merchant.get("category_slug"),
+            get_nested(merchant, "identity", "category_slug"),
+        )
+        category = get_category_context(category_slug)
+
+    return {
+        "category": category,
+        "merchant": merchant,
+        "customer": customer,
+        "trigger": trigger,
+    }
+
+
+# ================================================================
+# MERCHANT HELPERS
+# ================================================================
+
+def merchant_name(merchant: Dict[str, Any]) -> str:
+    return first_non_empty(
+        merchant.get("name"),
+        get_nested(merchant, "identity", "name"),
+        "your business",
+    )
+
+
+def merchant_language(merchant: Dict[str, Any]) -> str:
+    return first_non_empty(
+        get_nested(merchant, "identity", "languages"),
+        get_nested(merchant, "identity", "language"),
+        merchant.get("language"),
+        "",
+    )
+
+
+def get_active_offers(merchant: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not merchant:
+        return []
+
+    offers = merchant.get("offers", [])
+    if not isinstance(offers, list):
+        return []
+
+    active = []
+    for offer in offers:
+        if not isinstance(offer, dict):
+            continue
+
+        status = safe_lower(
+            first_non_empty(
+                offer.get("status"),
+                offer.get("state"),
+                "active",
+            )
+        )
+
+        if status in {"inactive", "expired", "disabled", "paused", "ended"}:
+            continue
+
+        active.append(offer)
+
+    return active
+
+
+def format_offer(offer: Dict[str, Any]) -> str:
+    title = first_non_empty(
+        offer.get("title"),
+        offer.get("name"),
+        offer.get("offer_title"),
+        "Special offer",
+    )
+
+    value = first_non_empty(
+        offer.get("value"),
+        offer.get("discount"),
+        offer.get("description"),
+    )
+
+    return f"{title} ({value})" if value else title
+
+
+def offer_summary(merchant: Optional[Dict[str, Any]]) -> str:
+    offers = get_active_offers(merchant)
+    if not offers:
+        return ""
+
+    return ", ".join(format_offer(offer) for offer in offers[:3])
+
+
+# ================================================================
+# CUSTOMER HELPERS
+# ================================================================
+
+def customer_name(customer: Dict[str, Any]) -> str:
+    return first_non_empty(
+        customer.get("name"),
+        get_nested(customer, "identity", "name"),
+        "",
+    )
+
+
+def customer_consent_scopes(customer: Optional[Dict[str, Any]]) -> List[str]:
+    if not customer:
+        return []
+
+    consent = customer.get("consent", {})
+    if not isinstance(consent, dict):
+        return []
+
+    scopes = consent.get("scope", [])
+    if not isinstance(scopes, list):
+        return []
+
+    return [safe_lower(scope) for scope in scopes]
+
+
+def has_consent(
+    customer: Optional[Dict[str, Any]],
+    *required_scopes: str,
+) -> bool:
+    if not customer:
+        return True
+
+    scopes = customer_consent_scopes(customer)
+    if not scopes:
+        return False
+
+    return any(safe_lower(scope) in scopes for scope in required_scopes)
+
+
+# ================================================================
+# INTENT DETECTION
+# ================================================================
+
+def detect_intent(message: str) -> str:
+    text = safe_lower(message)
+
+    if not text:
+        return "empty"
+
+    complaint_words = [
+        "complaint", "problem", "issue", "bad service",
+        "refund", "wrong", "not working", "disappointed",
+        "terrible", "poor service",
+    ]
+    if any(word in text for word in complaint_words):
+        return "complaint"
+
+    offer_words = [
+        "offer", "offers", "discount", "deal", "deals",
+        "coupon", "promo", "promotion", "cashback",
+    ]
+    if any(word in text for word in offer_words):
+        return "offer_query"
+
+    booking_words = [
+        "book", "booking", "appointment", "reserve",
+        "reservation", "slot", "available",
+    ]
+    if any(word in text for word in booking_words):
+        return "booking_query"
+
+    price_words = [
+        "price", "cost", "rate", "charges", "how much", "fee",
+    ]
+    if any(word in text for word in price_words):
+        return "price_query"
+
+    hours_words = [
+        "open", "close", "opening", "closing",
+        "timing", "timings", "hours",
+    ]
+    if any(word in text for word in hours_words):
+        return "hours_query"
+
+    followup_words = [
+        "tell me more",
+        "more details",
+        "more information",
+        "what about",
+        "how does it work",
+        "can you explain",
+        "explain more",
+        "details about",
+        "more about",
+        "tell me about",
+        "what is included",
+        "what's included",
+        "whats included",
+    ]
+    if any(phrase in text for phrase in followup_words):
+        return "followup_query"
+
+    # A greeting should only be classified as a greeting when it is
+    # essentially the whole message. This prevents "Hi, what offers..."
+    # from being incorrectly treated as a greeting.
+    greeting_words = [
+        "hi", "hello", "hey", "hii",
+        "good morning", "good afternoon", "good evening",
+    ]
+    greeting_only = any(
+        re.fullmatch(rf"\\s*{re.escape(word)}[!., ]*\\s*", text)
+        for word in greeting_words
+    )
+    if greeting_only:
+        return "greeting"
+
+    return "unknown"
+
+
+def should_reply(intent: str) -> bool:
+    return intent not in {"empty", "unknown"}
+
+
+# ================================================================
+# LOCAL RESPONSE COMPOSER
+# ================================================================
+
+def compose_reply(
+    intent: str,
+    merchant: Dict[str, Any],
+    customer: Dict[str, Any],
+    category: Dict[str, Any],
+) -> str:
+    name = merchant_name(merchant)
+    person = customer_name(customer)
+    greeting_name = f" {person}" if person else ""
+
+    if intent == "greeting":
+        return f"Hi{greeting_name}! How can I help you at {name}?"
+
+    if intent == "offer_query":
+        offers = offer_summary(merchant)
+
+        if offers:
+            return (
+                f"Sure{greeting_name}! Current offers at {name}: "
+                f"{offers}. Which one would you like to know more about?"
+            )
+
+        return (
+            f"Sure{greeting_name}! I don't see an active offer "
+            f"available at {name} right now. I can still help with "
+            f"bookings or other details."
+        )
+
+    if intent == "booking_query":
+        return (
+            f"Sure{greeting_name}! I can help you with a booking "
+            f"at {name}. What service and preferred time would you like?"
+        )
+
+    if intent == "price_query":
+        offers = offer_summary(merchant)
+
+        if offers:
+            return (
+                f"Sure{greeting_name}! I can help with pricing at "
+                f"{name}. Current listed offers include: {offers}."
+            )
+
+        return (
+            f"Sure{greeting_name}! I can help you check the "
+            f"pricing details at {name}. Which service are you looking for?"
+        )
+
+    if intent == "hours_query":
+        return (
+            f"Sure{greeting_name}! I can help you check the "
+            f"timings for {name}. Which day are you planning to visit?"
+        )
+
+    if intent == "complaint":
+        prefix = f", {person}" if person else ""
+        return (
+            f"I'm sorry to hear that{prefix}. Let me help you resolve "
+            f"this with {name}. Please share what went wrong."
+        )
+
+    if intent == "followup_query":
+        offers = offer_summary(merchant)
+        if offers:
+            return (
+                f"Sure{greeting_name}! Here are the current details "
+                f"at {name}: {offers}. If you'd like, I can help "
+                f"with the service or booking next."
+            )
+        return (
+            f"Sure{greeting_name}! I can share more details about "
+            f"the services at {name}. What would you like to know?"
+        )
+
+    return ""
+
+
+# ================================================================
+# TRIGGER HELPERS
+# ================================================================
+
+def trigger_kind(trigger: Dict[str, Any]) -> str:
+    return safe_lower(
+        first_non_empty(
+            trigger.get("kind"),
+            trigger.get("type"),
+        )
+    )
+
+
+def trigger_merchant_id(trigger: Dict[str, Any]) -> Optional[str]:
+    value = first_non_empty(trigger.get("merchant_id"))
+    return value or None
+
+
+def trigger_customer_id(trigger: Dict[str, Any]) -> Optional[str]:
+    value = first_non_empty(trigger.get("customer_id"))
+    return value or None
+
+
+# ================================================================
+# TRIGGER COMPOSER
+# ================================================================
+
+def compose_trigger_action(
+    trigger_id: str,
+    trigger: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    kind = trigger_kind(trigger)
+
+    merchant_id = trigger_merchant_id(trigger)
+    customer_id = trigger_customer_id(trigger)
+
+    bundle = build_context_bundle(
+        merchant_id=merchant_id,
+        customer_id=customer_id,
+        trigger_id=trigger_id,
+    )
+
+    merchant = bundle.get("merchant") or {}
+    customer = bundle.get("customer") or {}
+
+    if not merchant:
+        return None
+
+    name = merchant_name(merchant)
+    person = customer_name(customer)
+
+    promotional_kinds = {
+        "winback_eligible",
+        "festival_upcoming",
+        "wedding_package_followup",
+        "curious_ask_due",
+        "seasonal_perf_dip",
+        "category_seasonal",
+        "trial_followup",
+    }
+
+    if customer and kind in promotional_kinds:
+        if not has_consent(
+            customer,
+            "promotional_offers",
+            "bridal_package_followup",
+            "marketing",
+        ):
+            return None
+
+    if kind == "research_digest":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Research opportunity for {name}: there is a relevant "
+                f"category trend worth reviewing. Consider testing a small, "
+                f"category-fit offer and measuring response before scaling."
+            ),
+            "cta": "open_ended",
+            "rationale": "Relevant research/trend trigger with a restrained recommendation.",
+        }
+
+    if kind == "regulation_change":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Important update for {name}: a relevant regulatory change "
+                f"has been flagged. Please review the supplied guidance "
+                f"before changing customer-facing communication."
+            ),
+            "cta": "open_ended",
+            "rationale": "Regulatory trigger requires merchant attention.",
+        }
+
+    if kind == "recall_due":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Recall alert for {name}: a relevant product recall "
+                f"requires attention. Please verify the affected product "
+                f"and follow the supplied recall guidance."
+            ),
+            "cta": "open_ended",
+            "rationale": "Safety-related recall trigger takes priority over promotion.",
+        }
+
+    if kind in {"perf_dip", "seasonal_perf_dip"}:
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Heads-up for {name}: performance has dipped relative to "
+                f"the available baseline. Consider a small targeted "
+                f"experiment rather than broadly discounting."
+            ),
+            "cta": "open_ended",
+            "rationale": "Performance dip suggests a targeted experiment.",
+        }
+
+    if kind == "renewal_due":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Renewal reminder for {name}: the relevant renewal window "
+                f"is approaching. Consider following up with the "
+                f"merchant/customer context available."
+            ),
+            "cta": "open_ended",
+            "rationale": "Renewal trigger is timely and actionable.",
+        }
+
+    if kind == "festival_upcoming":
+        offers = offer_summary(merchant)
+        suffix = f" Existing active offers: {offers}." if offers else ""
+
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Festival opportunity for {name}: the upcoming occasion "
+                f"may be a good fit for a focused campaign.{suffix}"
+            ),
+            "cta": "open_ended",
+            "rationale": "Upcoming festival creates a timely engagement opportunity.",
+        }
+
+    if kind == "wedding_package_followup":
+        if not customer:
+            return None
+
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Hi {person}! Following up on your wedding-related "
+                f"interest with {name}. If you'd like, we can help with "
+                f"the next appointment or package details."
+            ),
+            "cta": "book",
+            "rationale": "Customer has a relevant wedding/bridal follow-up trigger.",
+        }
+
+    if kind == "curious_ask_due":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"A relevant customer question/opportunity has been flagged "
+                f"for {name}. A concise, helpful follow-up may be appropriate."
+            ),
+            "cta": "open_ended",
+            "rationale": "Curious-ask trigger creates a possible engagement opportunity.",
+        }
+
+    if kind in {"winback_eligible", "customer_lapsed_hard"}:
+        if not customer:
+            return None
+
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Hi {person}! We noticed it's been a while since your last "
+                f"visit to {name}. If you'd like to come back, we'd be happy "
+                f"to help you plan your next visit."
+            ),
+            "cta": "book",
+            "rationale": "Lapsed customer is eligible for a restrained win-back message.",
+        }
+
+    if kind == "ipl_match_today":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Event opportunity for {name}: today's match creates a "
+                f"potentially relevant engagement moment. Use only if it "
+                f"fits the merchant's category and offer."
+            ),
+            "cta": "open_ended",
+            "rationale": "Event trigger considered only when category-fit.",
+        }
+
+    if kind == "review_theme_emerged":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Review insight for {name}: a recurring customer theme "
+                f"has emerged. Consider addressing the underlying "
+                f"experience before pushing additional promotion."
+            ),
+            "cta": "open_ended",
+            "rationale": "Review theme suggests an experience improvement opportunity.",
+        }
+
+    if kind == "milestone_reached":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Milestone reached for {name}. This is a good moment to "
+                f"acknowledge the result and consider whether a small "
+                f"customer-engagement action is appropriate."
+            ),
+            "cta": "open_ended",
+            "rationale": "Merchant milestone creates a relevant engagement moment.",
+        }
+
+    if kind == "active_planning_intent":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Planning intent detected for {name}. This looks like a "
+                f"timely opportunity to turn the existing intent into a "
+                f"concrete next step."
+            ),
+            "cta": "open_ended",
+            "rationale": "Active planning intent is more actionable than generic outreach.",
+        }
+
+    if kind == "trial_followup":
+        if not customer:
+            return None
+
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Hi {person}! Following up on your recent trial with "
+                f"{name}. Would you like help planning your next visit?"
+            ),
+            "cta": "book",
+            "rationale": "Recent trial creates a relevant follow-up opportunity.",
+        }
+
+    if kind == "supply_alert":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Supply alert for {name}: a relevant supply issue has "
+                f"been flagged. Review availability before promoting "
+                f"the affected service or product."
+            ),
+            "cta": "open_ended",
+            "rationale": "Supply constraint should be considered before promotion.",
+        }
+
+    if kind == "chronic_refill_due":
+        if customer and not has_consent(customer, "refill_reminders"):
+            return None
+
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Refill reminder for {name}: a customer refill window "
+                f"has been flagged. Please follow the available customer "
+                f"and consent context."
+            ),
+            "cta": "open_ended",
+            "rationale": "Refill reminder uses the customer consent context.",
+        }
+
+    if kind == "gbp_unverified":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Action needed for {name}: the business listing is "
+                f"flagged as unverified. Resolve the listing issue "
+                f"before relying heavily on local discovery."
+            ),
+            "cta": "open_ended",
+            "rationale": "Unverified listing can affect local discovery.",
+        }
+
+    if kind == "cde_opportunity":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"A customer-engagement opportunity has been detected "
+                f"for {name}. Use the available merchant and customer "
+                f"context to make the next step specific."
+            ),
+            "cta": "open_ended",
+            "rationale": "CDE opportunity is relevant for targeted engagement.",
+        }
+
+    if kind == "competitor_opened":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Competitive signal for {name}: a nearby competitor has "
+                f"opened. Focus on your existing strengths and customer "
+                f"experience rather than reacting with a broad discount."
+            ),
+            "cta": "open_ended",
+            "rationale": "Competitive signal calls for measured response.",
+        }
+
+    if kind == "perf_spike":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Positive signal for {name}: performance has spiked. "
+                f"Consider identifying what drove the increase and "
+                f"replicating the strongest element."
+            ),
+            "cta": "open_ended",
+            "rationale": "Performance spike suggests learning and replication.",
+        }
+
+    if kind == "dormant_with_vera":
+        return {
+            "trigger_id": trigger_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "action": "send",
+            "body": (
+                f"Vera has a dormant engagement opportunity for {name}. "
+                f"Re-engage only when there is a concrete reason supported "
+                f"by the current context."
+            ),
+            "cta": "open_ended",
+            "rationale": "Dormant state requires restraint rather than generic outreach.",
+        }
+
+    return {
+        "trigger_id": trigger_id,
+        "merchant_id": merchant_id,
+        "customer_id": customer_id,
+        "action": "send",
+        "body": (
+            f"A relevant {kind or 'business'} signal has been detected "
+            f"for {name}. Review the available context before taking action."
+        ),
+        "cta": "open_ended",
+        "rationale": "Generic trigger fallback.",
+    }
+
+# load_seed_file("categories_seed.json", "category")
+load_seed_file(
+    filename="merchants_seed.json",
+    scope="merchant",
+    collection_key="merchants",
+    id_field="merchant_id",
+)
+
+load_seed_file(
+    filename="customers_seed.json",
+    scope="customer",
+    collection_key="customers",
+    id_field="customer_id",
+)
+
+load_seed_file(
+    filename="triggers_seed.json",
+    scope="trigger",
+    collection_key="triggers",
+    id_field="id",
+)
+
+# ================================================================
+# API ENDPOINTS
+# ================================================================
+
+@app.get("/v1/healthz")
+async def healthz():
+    counts = {
+        "category": 0,
+        "merchant": 0,
+        "customer": 0,
+        "trigger": 0,
+    }
+
+    for (scope, _context_id) in contexts_store:
+        if scope in counts:
+            counts[scope] += 1
+
+    return {
+        "status": "ok",
+        "uptime_seconds": int(time.time() - START_TIME),
+        "contexts_loaded": counts,
+    }
+
+
+@app.get("/v1/metadata")
+async def metadata():
+    return {
+        "team_name": "magicpin Vera Team",
+        "team_members": ["Kaushiki Sharma"],
+        "model": LLM_MODEL,
+        "approach": (
+            "local context-aware rule-based composer with "
+            "merchant, customer, category and trigger layers"
+        ),
+        "contact_email": "",
+        "version": "1.0.0",
+        "submitted_at": now_iso(),
+    }
+
+
+@app.post("/v1/context")
+async def push_context(body: ContextBody):
+    valid_scopes = {
+        "category",
+        "merchant",
+        "customer",
+        "trigger",
+    }
+
+    if body.scope not in valid_scopes:
+        return {
+            "accepted": False,
+            "reason": "invalid_scope",
+            "details": f"scope must be one of: {sorted(valid_scopes)}",
+        }
+
+    key = (body.scope, body.context_id)
+    current = contexts_store.get(key)
+
+    if current and current["version"] >= body.version:
+        return {
+            "accepted": False,
+            "reason": "stale_version",
+            "current_version": current["version"],
+        }
+
+    contexts_store[key] = {
+        "version": body.version,
+        "payload": body.payload,
+        "delivered_at": body.delivered_at,
+    }
+
+    return {
+        "accepted": True,
+        "ack_id": f"ack_{body.context_id}_v{body.version}",
+        "stored_at": now_iso(),
+    }
+
+
+@app.post("/v1/tick")
+async def tick(body: TickBody):
+    actions: List[Dict[str, Any]] = []
+
+    for trigger_id in body.available_triggers:
+        trigger = get_trigger_context(trigger_id)
+
+        if not trigger:
+            continue
+
+        if trigger_id in processed_triggers:
+            continue
+
+        action = compose_trigger_action(
+            trigger_id,
+            trigger,
+        )
+
+        if action is None:
+            processed_triggers[trigger_id] = time.time()
+            continue
+
+        actions.append(action)
+        processed_triggers[trigger_id] = time.time()
+
+    return {
+        "actions": actions
+    }
+
+
+@app.post("/v1/reply")
+async def reply(body: ReplyBody):
+    conversation = conversations_store.setdefault(
+        body.conversation_id,
+        [],
+    )
+
+    conversation.append(
+        {
+            "from": body.from_role,
+            "message": body.message,
+            "turn_number": body.turn_number,
+            "received_at": body.received_at,
+        }
+    )
+
+    if len(conversation) > 20:
+        del conversation[:-20]
+
+    context_bundle = build_context_bundle(
+        merchant_id=body.merchant_id,
+        customer_id=body.customer_id,
+    )
+
+    merchant = context_bundle.get("merchant") or {}
+    customer = context_bundle.get("customer") or {}
+    category = context_bundle.get("category") or {}
+
+    intent = detect_intent(body.message)
+
+    if not should_reply(intent):
+        return {
+            "action": "wait",
+            "body": "",
+            "cta": "open_ended",
+            "rationale": f"No reply needed for intent: {intent}.",
+            "intent": intent,
+        }
+
+    response_text = compose_reply(
+        intent,
+        merchant,
+        customer,
+        category,
+    )
+
+    if not response_text:
+        return {
+            "action": "wait",
+            "body": "",
+            "cta": "open_ended",
+            "rationale": "No sufficiently confident local response.",
+            "intent": intent,
+        }
+
+    return {
+        "action": "send",
+        "body": response_text,
+        "cta": "book" if intent == "booking_query" else "open_ended",
+        "rationale": (
+            f"Responding to detected intent '{intent}' "
+            f"using available context."
+        ),
+        "intent": intent,
+        "context_loaded": {
+            "category": context_bundle["category"] is not None,
+            "merchant": context_bundle["merchant"] is not None,
+            "customer": context_bundle["customer"] is not None,
+        },
+    }
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "bot:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=True,
+    )
