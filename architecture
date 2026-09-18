@@ -1,0 +1,17 @@
+             Merchant Data
+                  |
+Customer Data --->|
+                  |
+Category Data --->| 
+                  |
+Trigger/Event --->|
+                  ↓
+          Context Builder
+                  ↓
+        Response Generation
+                  ↓
+             AI / Rules
+                  ↓
+             API Response
+                  ↓
+       WhatsApp / Frontend
